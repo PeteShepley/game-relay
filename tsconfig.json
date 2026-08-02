@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "preserve",
+    "moduleResolution": "bundler",
+    "types": ["node"],
+    "lib": ["ES2022"],
+    "noEmit": true,
+    "rootDir": "./src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "**/*.test.ts"]
+}
