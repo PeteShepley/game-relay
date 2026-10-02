@@ -1,16 +1,14 @@
 // The wire protocol between a game client and the relay. This file is the
 // canonical definition: games import it as `@peteshepley/game-relay/protocol`
-// rather than re-declaring it. The relay never runs a game engine, so an
-// Action is an opaque tagged object: it only stamps, stores, and fans out
-// actions, never inspecting their contents.
+// rather than re-declaring it. It holds types only — no runtime values — so
+// any consumer (CommonJS here, ESM in the games) can import it. The relay
+// never runs a game engine, so an Action is an opaque tagged object: it only
+// stamps, stores, and fans out actions, never inspecting their contents.
 
 // Seats are lettered in join order: the creator is 'a', the next player 'b',
 // and so on. A two-player game therefore sees exactly the 'a' | 'b' it had
 // when the relay was gin-rummy-only.
 export type SeatId = string
-
-// The most players any one room can hold.
-export const MAX_SEATS = 8
 
 export type Action = { readonly type: string; readonly [key: string]: unknown }
 

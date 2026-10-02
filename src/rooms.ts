@@ -45,6 +45,9 @@ function mix32(x: number): number {
   return (h ^ (h >>> 16)) >>> 0
 }
 
+// The most players any one room can hold (seat ids run 'a'..'h').
+export const MAX_SEATS = 8
+
 // Seat ids by position: 0 -> 'a', 1 -> 'b', ...
 export function seatIdAt(index: number): string {
   return String.fromCharCode(97 + index)
