@@ -1,42 +1,84 @@
-import { generateCode, generateToken, seedFrom } from './rooms'
-import { CodeCollision } from './store'
+import { generateCode, generateToken, seatIdAt, seedFrom } from './rooms'
+import { CodeCollision, StaleRoom } from './store'
 import type { Room, RoomStore, SeatState } from './store'
-import type { Action, Contract, Seat, Send, WireMessage } from './protocol'
+import { MAX_SEATS } from './protocol'
+import type { Action, Contract, Roster, SeatId, Send, WireMessage } from './protocol'
 
-// The relay core: a rules-ignorant sequencer. It owns room lifecycle, the
-// per-room monotonic action order, and message fan-out, but never runs the
-// game engine — illegal actions are stamped and fanned out anyway, and both
-// clients reject them identically as deterministic no-ops (DESIGN.md). Every
-// handler returns the messages to deliver; the adapter (Lambda or local ws
-// harness) does the actual sending, so this module has no AWS imports.
+// The relay core: a rules-ignorant sequencer shared by every game. It owns
+// room lifecycle, the per-room monotonic action order, and message fan-out,
+// but never runs a game engine — illegal actions are stamped and fanned out
+// anyway, and every client rejects them identically as deterministic no-ops.
+// Every handler returns the messages to deliver; the adapter (Lambda or local
+// ws harness) does the actual sending, so this module has no AWS imports.
 
 const to = (connectionId: string, message: WireMessage): Send => ({ connectionId, message })
 
+const GAME_ID = /^[a-z0-9][a-z0-9-]{0,31}$/
+const MAX_NAME = 40
+
+const started = (room: Room): boolean => room.seed !== null
+
 function contractOf(room: Room): Contract | null {
-  if (room.seed === null || room.seatB === null) return null
+  if (room.seed === null) return null
   return {
+    game: room.game,
     seed: room.seed,
-    dealer: room.dealer,
-    seats: { creator: 'a', joiner: 'b' },
-    names: { a: room.seatA.name, b: room.seatB.name },
+    dealer: room.seats[0].id,
+    seats: room.seats.map(({ id, name }) => ({ id, name })),
   }
 }
 
-function seatOf(room: Room, seat: Seat): SeatState | null {
-  return seat === 'a' ? room.seatA : room.seatB
+function rosterOf(room: Room): Roster {
+  return {
+    seats: room.seats.map(({ id, name, connected }) => ({ id, name, connected })),
+    minSeats: room.minSeats,
+    maxSeats: room.maxSeats,
+    started: started(room),
+  }
 }
 
-function withSeat(room: Room, seat: Seat, next: SeatState): Room {
-  return seat === 'a' ? { ...room, seatA: next } : { ...room, seatB: next }
+function withSeat(room: Room, id: SeatId, next: SeatState): Room {
+  return { ...room, seats: room.seats.map((seat) => (seat.id === id ? next : seat)) }
 }
 
-// The live connections a fan-out should reach: both seats that currently
-// hold a socket.
+// The live connections a fan-out should reach: every seat that currently
+// holds a socket.
 function connectedConns(room: Room): string[] {
-  const conns: string[] = []
-  if (room.seatA.conn) conns.push(room.seatA.conn)
-  if (room.seatB?.conn) conns.push(room.seatB.conn)
-  return conns
+  return room.seats.flatMap((seat) => (seat.conn ? [seat.conn] : []))
+}
+
+const broadcast = (room: Room, message: WireMessage): Send[] =>
+  connectedConns(room).map((conn) => to(conn, message))
+
+// Starting a room fixes the seed from every seat's contribution, in seat
+// order, and sends each connected seat the contract.
+function begin(room: Room): Room {
+  return { ...room, seed: seedFrom(room.seats.map((seat) => seat.rnd)) }
+}
+
+// Read-modify-write a room under its version guard, retrying when another
+// invocation got there first. `fn` returns the room to write (or null to
+// write nothing) and the result to hand back once the write lands.
+async function updateRoom<T>(
+  store: RoomStore,
+  code: string,
+  fn: (room: Room) => { next: Room | null; result: T },
+  missing: T,
+): Promise<T> {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const room = await store.getRoom(code)
+    if (!room) return missing
+    const { next, result } = fn(room)
+    if (!next) return result
+    try {
+      await store.putRoom(next)
+      return result
+    } catch (err) {
+      if (err instanceof StaleRoom) continue
+      throw err
+    }
+  }
+  throw new Error(`room ${code} kept changing under us`)
 }
 
 // $connect has nothing to record — a connection is bound to a room only once
@@ -53,78 +95,161 @@ export async function handleMessage(
 ): Promise<Send[]> {
   switch (message.kind) {
     case 'create':
-      return create(store, connectionId, message.name, message.rnd)
+      return create(store, connectionId, message)
     case 'join':
-      return join(store, connectionId, message.code, message.name, message.rnd)
+      return join(store, connectionId, message)
     case 'reconnect':
       return reconnect(store, connectionId, message.code, message.token)
+    case 'begin':
+      return beginRequest(store, connectionId)
     case 'submit':
       return submit(store, connectionId, message.action)
     case 'resyncRequest':
       return resync(store, connectionId)
+    case 'ping':
+      return [to(connectionId, { kind: 'pong' })]
     default:
-      // created/joined/error/start/action/resync are server->client only; a
-      // client never sends them, so there is nothing to do.
+      // Every other kind is server->client only; a client never sends them.
       return []
   }
 }
 
+function validSeats(minSeats: unknown, maxSeats: unknown): boolean {
+  return (
+    Number.isInteger(minSeats) &&
+    Number.isInteger(maxSeats) &&
+    (minSeats as number) >= 2 &&
+    (minSeats as number) <= (maxSeats as number) &&
+    (maxSeats as number) <= MAX_SEATS
+  )
+}
+
+const cleanName = (name: unknown): string => String(name ?? '').trim().slice(0, MAX_NAME)
+
 async function create(
   store: RoomStore,
   connectionId: string,
-  name: string,
-  rnd: number,
+  message: Extract<WireMessage, { kind: 'create' }>,
 ): Promise<Send[]> {
-  const seatA: SeatState = { conn: connectionId, name, token: generateToken(), connected: true }
+  const { game, rnd, minSeats, maxSeats } = message
+  if (typeof game !== 'string' || !GAME_ID.test(game) || !validSeats(minSeats, maxSeats)) {
+    return [to(connectionId, { kind: 'error', reason: 'badRequest' })]
+  }
+
+  const creator: SeatState = {
+    id: seatIdAt(0),
+    conn: connectionId,
+    name: cleanName(message.name),
+    token: generateToken(),
+    connected: true,
+    rnd: rnd >>> 0,
+  }
   // Retry on the vanishingly rare code collision.
-  let code = ''
-  for (let attempt = 0; attempt < 5; attempt++) {
-    code = generateCode()
-    const room: Room = { code, dealer: 'a', seed: null, rndCreator: rnd, seatA, seatB: null }
+  let room: Room | null = null
+  for (let attempt = 0; attempt < 5 && !room; attempt++) {
+    const candidate: Room = {
+      code: generateCode(),
+      game,
+      minSeats,
+      maxSeats,
+      seed: null,
+      seats: [creator],
+      version: 0,
+    }
     try {
-      await store.createRoom(room)
-      break
+      await store.createRoom(candidate)
+      room = candidate
     } catch (err) {
-      if (err instanceof CodeCollision) {
-        code = ''
-        continue
-      }
-      throw err
+      if (!(err instanceof CodeCollision)) throw err
     }
   }
-  if (!code) throw new Error('could not allocate a room code')
+  if (!room) throw new Error('could not allocate a room code')
 
-  await store.putConn(connectionId, { code, seat: 'a' })
-  // No `start` yet: the contract needs both players. The creator waits on the
-  // code; `start` fans out to both when the joiner arrives.
-  return [to(connectionId, { kind: 'created', code, token: seatA.token })]
+  await store.putConn(connectionId, { code: room.code, seat: creator.id })
+  // No `start` yet: the creator waits on the code until the room fills or
+  // they send `begin`.
+  return [
+    to(connectionId, { kind: 'created', code: room.code, token: creator.token, seat: creator.id }),
+    to(connectionId, { kind: 'roster', ...rosterOf(room) }),
+  ]
 }
 
 async function join(
   store: RoomStore,
   connectionId: string,
-  code: string,
-  name: string,
-  rnd: number,
+  message: Extract<WireMessage, { kind: 'join' }>,
 ): Promise<Send[]> {
-  const room = await store.getRoom(code)
-  if (!room) return [to(connectionId, { kind: 'error', reason: 'badCode' })]
-  // The second seat is joinable only once. After that, coming back is a
-  // reconnect (token-gated), never a fresh join — this is what stops a
-  // stranger with the code from taking a disconnected player's seat.
-  if (room.seatB !== null) return [to(connectionId, { kind: 'error', reason: 'roomFull' })]
+  const { code, game, rnd } = message
+  const fail = (reason: Extract<WireMessage, { kind: 'error' }>['reason']) => ({
+    next: null,
+    result: [to(connectionId, { kind: 'error', reason })],
+  })
 
-  const seatB: SeatState = { conn: connectionId, name, token: generateToken(), connected: true }
-  const seed = seedFrom(room.rndCreator, rnd)
-  const joined: Room = { ...room, seed, seatB }
-  await store.putRoom(joined)
-  await store.putConn(connectionId, { code, seat: 'b' })
+  let seat: SeatState | null = null
+  const sends = await updateRoom<Send[]>(
+    store,
+    code,
+    (room) => {
+      seat = null
+      if (room.game !== game) return fail('wrongGame')
+      // Seats are joinable only before the start. After that, coming back is
+      // a reconnect (token-gated), never a fresh join — this is what stops a
+      // stranger with the code from taking a disconnected player's seat.
+      if (started(room)) return fail('alreadyStarted')
+      if (room.seats.length >= room.maxSeats) return fail('roomFull')
 
-  const contract = contractOf(joined)!
-  const start: WireMessage = { kind: 'start', ...contract }
-  const sends: Send[] = [to(connectionId, { kind: 'joined', token: seatB.token })]
-  for (const conn of connectedConns(joined)) sends.push(to(conn, start))
+      seat = {
+        id: seatIdAt(room.seats.length),
+        conn: connectionId,
+        name: cleanName(message.name),
+        token: generateToken(),
+        connected: true,
+        rnd: rnd >>> 0,
+      }
+      let next: Room = { ...room, seats: [...room.seats, seat] }
+      // A full room starts on its own; otherwise the creator sends `begin`.
+      if (next.seats.length === next.maxSeats) next = begin(next)
+
+      const joined = to(connectionId, { kind: 'joined', code, token: seat.token, seat: seat.id })
+      const contract = contractOf(next)
+      return {
+        next,
+        result: [
+          joined,
+          ...broadcast(next, { kind: 'roster', ...rosterOf(next) }),
+          ...(contract ? broadcast(next, { kind: 'start', ...contract }) : []),
+        ],
+      }
+    },
+    [to(connectionId, { kind: 'error', reason: 'badCode' })],
+  )
+
+  const claimed = seat as SeatState | null
+  if (claimed) await store.putConn(connectionId, { code, seat: claimed.id })
   return sends
+}
+
+async function beginRequest(store: RoomStore, connectionId: string): Promise<Send[]> {
+  const ref = await store.getConn(connectionId)
+  if (!ref) return []
+  const error = (reason: 'notCreator' | 'notEnoughPlayers') => ({
+    next: null,
+    result: [to(connectionId, { kind: 'error', reason })],
+  })
+
+  return updateRoom<Send[]>(
+    store,
+    ref.code,
+    (room) => {
+      if (ref.seat !== room.seats[0].id) return error('notCreator')
+      // A late or duplicate begin after the start is harmless: ignore it.
+      if (started(room)) return { next: null, result: [] }
+      if (room.seats.length < room.minSeats) return error('notEnoughPlayers')
+      const next = begin(room)
+      return { next, result: broadcast(next, { kind: 'start', ...contractOf(next)! }) }
+    },
+    [],
+  )
 }
 
 async function reconnect(
@@ -133,86 +258,92 @@ async function reconnect(
   code: string,
   token: string,
 ): Promise<Send[]> {
-  const room = await store.getRoom(code)
-  if (!room) return [to(connectionId, { kind: 'error', reason: 'badCode' })]
+  let seatId: SeatId | null = null
+  const sends = await updateRoom<Send[]>(
+    store,
+    code,
+    (room) => {
+      seatId = null
+      const current = room.seats.find((seat) => seat.token === token)
+      if (!current) return { next: null, result: [to(connectionId, { kind: 'error', reason: 'badToken' })] }
+      seatId = current.id
 
-  const seat: Seat | null =
-    room.seatA.token === token ? 'a' : room.seatB?.token === token ? 'b' : null
-  if (!seat) return [to(connectionId, { kind: 'error', reason: 'badToken' })]
+      const next = withSeat(room, current.id, { ...current, conn: connectionId, connected: true })
+      const roster = broadcast(next, { kind: 'roster', ...rosterOf(next) })
+      // Restore whatever state this player left: still in the lobby ->
+      // re-announce the seat; mid-game -> a full bootstrap from the log
+      // (the log is read after the write lands, below).
+      if (!started(next)) {
+        const kind = current.id === next.seats[0].id ? 'created' : 'joined'
+        return { next, result: [to(connectionId, { kind, code, token, seat: current.id }), ...roster] }
+      }
+      return { next, result: roster }
+    },
+    [to(connectionId, { kind: 'error', reason: 'badCode' })],
+  )
+  const reattached = seatId as SeatId | null
+  if (!reattached) return sends
 
-  const current = seatOf(room, seat)!
-  const reattached = withSeat(room, seat, { ...current, conn: connectionId, connected: true })
-  await store.putRoom(reattached)
-  await store.putConn(connectionId, { code, seat })
-
-  // Restore whatever state this player left: still in the lobby (no joiner
-  // yet) -> re-announce the code; mid-game -> a full bootstrap from the log.
-  const contract = contractOf(reattached)
-  if (!contract) {
-    return [to(connectionId, { kind: 'created', code, token })]
-  }
-  const log = await store.readLog(code)
-  if (log.length === 0) return [to(connectionId, { kind: 'start', ...contract })]
-  return [to(connectionId, { kind: 'resync', ...contract, log })]
+  await store.putConn(connectionId, { code, seat: reattached })
+  const bootstrap = await bootstrapFor(store, code, connectionId)
+  return [...sends, ...bootstrap]
 }
 
-async function submit(
-  store: RoomStore,
-  connectionId: string,
-  action: Action,
-): Promise<Send[]> {
+async function submit(store: RoomStore, connectionId: string, action: Action): Promise<Send[]> {
   const ref = await store.getConn(connectionId)
   if (!ref) return []
   const room = await store.getRoom(ref.code)
-  if (!room) return []
+  if (!room || !started(room)) return []
 
   // The sequencer stamps: an atomic per-room counter assigns the order, then
   // we persist before fanning out so a resync always sees a stamped action.
   const seq = await store.nextSeq(ref.code)
   const stamped = { seq, action }
   await store.appendLog(ref.code, stamped)
-
-  const fanout: WireMessage = { kind: 'action', ...stamped }
-  return connectedConns(room).map((conn) => to(conn, fanout))
+  return broadcast(room, { kind: 'action', ...stamped })
 }
 
 async function resync(store: RoomStore, connectionId: string): Promise<Send[]> {
   const ref = await store.getConn(connectionId)
   if (!ref) return []
-  const room = await store.getRoom(ref.code)
-  if (!room) return []
-  const contract = contractOf(room)
+  return bootstrapFor(store, ref.code, connectionId)
+}
+
+// The fresh contract (no actions yet) or the contract + full log.
+async function bootstrapFor(store: RoomStore, code: string, connectionId: string): Promise<Send[]> {
+  const room = await store.getRoom(code)
+  const contract = room && contractOf(room)
   if (!contract) return []
-  const log = await store.readLog(ref.code)
+  const log = await store.readLog(code)
   if (log.length === 0) return [to(connectionId, { kind: 'start', ...contract })]
   return [to(connectionId, { kind: 'resync', ...contract, log })]
 }
 
-// A socket closed. Mark that seat absent; if the other seat is also gone (or
-// never filled) the room is abandoned and deleted immediately, per the rule
-// "if both players disconnect the game is abandoned". A single disconnect
-// keeps the seat reserved and rejoinable via its token.
+// A socket closed. Mark that seat absent; if no seat is still connected the
+// room is abandoned and deleted immediately. Otherwise the seat stays
+// reserved, rejoinable via its token, and everyone left sees the new roster.
 export async function handleDisconnect(store: RoomStore, connectionId: string): Promise<Send[]> {
   const ref = await store.getConn(connectionId)
   await store.deleteConn(connectionId)
   if (!ref) return []
 
-  const room = await store.getRoom(ref.code)
-  if (!room) return []
+  let abandoned = false
+  const sends = await updateRoom<Send[]>(
+    store,
+    ref.code,
+    (room) => {
+      abandoned = false
+      const current = room.seats.find((seat) => seat.id === ref.seat)
+      // A stale socket that a reconnect already replaced: leave the live seat be.
+      if (!current || current.conn !== connectionId) return { next: null, result: [] }
 
-  const current = seatOf(room, ref.seat)
-  // A stale socket that a reconnect already replaced: leave the live seat be.
-  if (!current || current.conn !== connectionId) return []
+      const next = withSeat(room, current.id, { ...current, conn: null, connected: false })
+      abandoned = next.seats.every((seat) => !seat.connected)
+      return { next, result: broadcast(next, { kind: 'roster', ...rosterOf(next) }) }
+    },
+    [],
+  )
 
-  const vacated = withSeat(room, ref.seat, { ...current, conn: null, connected: false })
-  const other = seatOf(vacated, ref.seat === 'a' ? 'b' : 'a')
-  const abandoned = other === null || !other.connected
-
-  if (abandoned) {
-    if (other?.conn) await store.deleteConn(other.conn)
-    await store.deleteRoom(ref.code)
-  } else {
-    await store.putRoom(vacated)
-  }
-  return []
+  if (abandoned) await store.deleteRoom(ref.code)
+  return sends
 }

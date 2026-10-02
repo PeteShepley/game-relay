@@ -9,38 +9,51 @@ import {
   QueryCommand,
   UpdateCommand,
 } from '@aws-sdk/lib-dynamodb'
-import type { Seat, Stamped } from './protocol'
+import type { SeatId, Stamped } from './protocol'
 
 // One seat's occupant. `conn` is the live connection id (null while the
 // player is disconnected); `token` is the reconnection secret; `connected`
-// tracks presence for the abandonment rule.
+// tracks presence for the abandonment rule; `rnd` is the player's seed
+// contribution, folded in when the game starts.
 export interface SeatState {
+  readonly id: SeatId
   readonly conn: string | null
   readonly name: string
   readonly token: string
   readonly connected: boolean
+  readonly rnd: number
 }
 
-// A room as the relay core sees it. The monotonic sequence counter is NOT
-// here — it is a store-internal value bumped atomically by nextSeq(), so a
-// full putRoom() (seat/presence updates) can never clobber a concurrent
-// stamp. `seed` and `seatB` are null until the second player joins.
+// A room as the relay core sees it. `seats` is in seat order and seats[0] is
+// the creator. `seed` is null until the game starts, so `seed !== null` is
+// what "started" means. `version` is the optimistic-concurrency guard: every
+// putRoom must present the version it read, so two racing joins can't both
+// claim the same next seat.
+//
+// The monotonic sequence counter is NOT here — it is a store-internal value
+// bumped atomically by nextSeq(), so a putRoom() (seat/presence updates) can
+// never clobber a concurrent stamp.
 export interface Room {
   readonly code: string
-  readonly dealer: Seat
+  readonly game: string
+  readonly minSeats: number
+  readonly maxSeats: number
   readonly seed: number | null
-  readonly rndCreator: number
-  readonly seatA: SeatState
-  readonly seatB: SeatState | null
+  readonly seats: readonly SeatState[]
+  readonly version: number
 }
 
 // Thrown by createRoom when the code is already taken, so the caller can
 // retry with a fresh one.
 export class CodeCollision extends Error {}
 
+// Thrown by putRoom when the room changed since it was read; the caller
+// re-reads and recomputes.
+export class StaleRoom extends Error {}
+
 export interface ConnRef {
   readonly code: string
-  readonly seat: Seat
+  readonly seat: SeatId
 }
 
 // The persistence seam. The Lambda uses DynamoRoomStore; tests and the local
@@ -49,6 +62,8 @@ export interface ConnRef {
 export interface RoomStore {
   createRoom(room: Room): Promise<void>
   getRoom(code: string): Promise<Room | null>
+  // Writes `room` (seats + seed) if the stored version is still
+  // `room.version`, bumping it; otherwise throws StaleRoom.
   putRoom(room: Room): Promise<void>
   deleteRoom(code: string): Promise<void>
   nextSeq(code: string): Promise<number>
@@ -86,8 +101,8 @@ export class InMemoryRoomStore implements RoomStore {
 
   async putRoom(room: Room): Promise<void> {
     const entry = this.rooms.get(room.code)
-    if (!entry) throw new Error(`putRoom on unknown room ${room.code}`)
-    entry.room = clone(room)
+    if (!entry || entry.room.version !== room.version) throw new StaleRoom(room.code)
+    entry.room = clone({ ...room, version: room.version + 1 })
   }
 
   async deleteRoom(code: string): Promise<void> {
@@ -192,33 +207,38 @@ export class DynamoRoomStore implements RoomStore {
   }
 
   async putRoom(room: Room): Promise<void> {
-    // Targeted SET on the mutable fields only; nextSeq is left untouched so a
-    // concurrent stamp is never rolled back. Every attribute name is aliased
-    // so a DynamoDB reserved word can never break the expression.
-    await this.doc.send(
-      new UpdateCommand({
-        TableName: this.table,
-        Key: { PK: roomPk(room.code), SK: 'META' },
-        UpdateExpression:
-          'SET #seed = :seed, #rnd = :rnd, #seatA = :seatA, #seatB = :seatB, #dealer = :dealer, #ttl = :ttl',
-        ExpressionAttributeNames: {
-          '#seed': 'seed',
-          '#rnd': 'rndCreator',
-          '#seatA': 'seatA',
-          '#seatB': 'seatB',
-          '#dealer': 'dealer',
-          '#ttl': 'ttl',
-        },
-        ExpressionAttributeValues: {
-          ':seed': room.seed,
-          ':rnd': room.rndCreator,
-          ':seatA': room.seatA,
-          ':seatB': room.seatB,
-          ':dealer': room.dealer,
-          ':ttl': ttl(),
-        },
-      }),
-    )
+    // Targeted SET on the mutable fields only, conditional on the version we
+    // read; nextSeq is left untouched so a concurrent stamp is never rolled
+    // back. game/minSeats/maxSeats are fixed at create. Every attribute name
+    // is aliased so a DynamoDB reserved word can never break the expression.
+    try {
+      await this.doc.send(
+        new UpdateCommand({
+          TableName: this.table,
+          Key: { PK: roomPk(room.code), SK: 'META' },
+          UpdateExpression: 'SET #seed = :seed, #seats = :seats, #version = :next, #ttl = :ttl',
+          ConditionExpression: '#version = :version',
+          ExpressionAttributeNames: {
+            '#seed': 'seed',
+            '#seats': 'seats',
+            '#version': 'version',
+            '#ttl': 'ttl',
+          },
+          ExpressionAttributeValues: {
+            ':seed': room.seed,
+            ':seats': room.seats,
+            ':version': room.version,
+            ':next': room.version + 1,
+            ':ttl': ttl(),
+          },
+        }),
+      )
+    } catch (err) {
+      if ((err as { name?: string }).name === 'ConditionalCheckFailedException') {
+        throw new StaleRoom(room.code)
+      }
+      throw err
+    }
   }
 
   async deleteRoom(code: string): Promise<void> {
@@ -312,21 +332,23 @@ export class DynamoRoomStore implements RoomStore {
 function serializeRoom(room: Room) {
   return {
     code: room.code,
-    dealer: room.dealer,
+    game: room.game,
+    minSeats: room.minSeats,
+    maxSeats: room.maxSeats,
     seed: room.seed,
-    rndCreator: room.rndCreator,
-    seatA: room.seatA,
-    seatB: room.seatB,
+    seats: room.seats,
+    version: room.version,
   }
 }
 
 function deserializeRoom(item: Record<string, unknown>): Room {
   return {
     code: item.code as string,
-    dealer: item.dealer as Seat,
-    seed: (item.seed as number | null) ?? null,
-    rndCreator: item.rndCreator as number,
-    seatA: item.seatA as SeatState,
-    seatB: (item.seatB as SeatState | null) ?? null,
+    game: item.game as string,
+    minSeats: Number(item.minSeats),
+    maxSeats: Number(item.maxSeats),
+    seed: item.seed === null || item.seed === undefined ? null : Number(item.seed),
+    seats: item.seats as SeatState[],
+    version: Number(item.version),
   }
 }

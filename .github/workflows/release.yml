@@ -1,0 +1,48 @@
+name: Release
+
+# Test, bundle the Lambda, and publish function.zip as a GitHub Release
+# (tag v0.<run>). Deploy runs from operations:
+# `scripts/deploy ws relay <env> v0.<run>`.
+#
+# The tag doubles as the protocol version games pin:
+# "@peteshepley/game-relay": "github:PeteShepley/game-relay#v0.<run>".
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency: release-${{ github.ref }}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+      - name: Package
+        run: |
+          (cd dist && zip -qr ../function.zip .)
+          jq -n --arg sha "$GITHUB_SHA" \
+            '{type:"lambda", runtime:"nodejs22.x", handler:"index.handler", commit:$sha}' > manifest.json
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v0.${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" function.zip manifest.json \
+            --title "$TAG" \
+            --notes "Build of ${GITHUB_SHA:0:7} for wss://ws.peteshepley.com/relay"

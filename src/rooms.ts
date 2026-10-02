@@ -1,7 +1,7 @@
 import { randomBytes, randomInt } from 'node:crypto'
 
 // A no-look-alike alphabet: no 0/O, 1/I/L. Six characters give ~10^9 codes,
-// which are only guessable while a room has an open second seat, so an
+// which are only guessable while a room still has an open seat, so an
 // enumerating stranger has a vanishing window and reconnection is gated by a
 // token rather than the code (see relay.ts).
 const CODE_ALPHABET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ'
@@ -22,17 +22,20 @@ export function generateToken(): string {
   return randomBytes(24).toString('base64url')
 }
 
-// The shuffle seed both players contribute to: each side commits a random
-// uint32 without seeing the other's, and the engine PRNG seed is a mix of
-// both. Neither side alone can grind for a favourable deal. The output is a
-// uint32 because the engine's mulberry32 threads a uint32 state.
+// The shuffle seed every player contributes to: each seat commits a random
+// uint32 without seeing the others', and the engine PRNG seed is a mix of
+// all of them. No single player can grind for a favourable deal. The output
+// is a uint32 because the engines' mulberry32 threads a uint32 state.
 //
-// The creator's value is mixed first, then the joiner's is folded in with an
-// add (not a xor) after that nonlinear round — otherwise (a,b) and (b,a)
-// would collapse to the same seed, and neither round could cancel the other.
-export function seedFrom(rndCreator: number, rndJoiner: number): number {
-  const mixed = mix32((rndCreator >>> 0) ^ 0x9e3779b9)
-  return mix32((mixed + (rndJoiner >>> 0)) >>> 0)
+// Contributions are folded in seat order, each with an add (not a xor) after
+// a nonlinear round — so the order matters ((a,b) and (b,a) give different
+// seeds) and no contribution can cancel another. For two seats this is
+// exactly the seed the gin-rummy-only relay produced.
+export function seedFrom(rnds: readonly number[]): number {
+  if (rnds.length === 0) throw new Error('seedFrom needs at least one contribution')
+  let h = mix32((rnds[0] >>> 0) ^ 0x9e3779b9)
+  for (const rnd of rnds.slice(1)) h = mix32((h + (rnd >>> 0)) >>> 0)
+  return h
 }
 
 function mix32(x: number): number {
@@ -40,4 +43,9 @@ function mix32(x: number): number {
   h = Math.imul(h ^ (h >>> 16), 0x85ebca6b) >>> 0
   h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35) >>> 0
   return (h ^ (h >>> 16)) >>> 0
+}
+
+// Seat ids by position: 0 -> 'a', 1 -> 'b', ...
+export function seatIdAt(index: number): string {
+  return String.fromCharCode(97 + index)
 }

@@ -8,7 +8,7 @@ import { DynamoRoomStore } from './store'
 import type { Send, WireMessage } from './protocol'
 
 // Reused across warm invocations.
-const store = new DynamoRoomStore(process.env.ROOMS_TABLE ?? 'gin-rummy-rooms')
+const store = new DynamoRoomStore(process.env.ROOMS_TABLE ?? 'game-relay-rooms')
 const managementClients = new Map<string, ApiGatewayManagementApiClient>()
 
 const ok: APIGatewayProxyResultV2 = { statusCode: 200, body: '' }

@@ -7,7 +7,7 @@ import type { Send, WireMessage } from './protocol'
 
 // A dev-only relay: the SAME core (relay.ts) driven by the in-memory store,
 // exposed over a plain WebSocket server. Point the web client at
-// VITE_WS_URL=ws://localhost:8787 and two browsers get real networked play —
+// VITE_WS_URL=ws://localhost:8787 and several browsers get real networked play —
 // rooms, codes, names, stamping, resync, reconnect, abandonment — with no
 // AWS. This is to the relay what the BroadcastChannel loopback is to two
 // tabs: the protocol, exercised early.
@@ -47,4 +47,4 @@ function deliver(sends: Send[]): void {
   }
 }
 
-console.log(`gin-rummy relay (local) listening on ws://localhost:${port}`)
+console.log(`game relay (local) listening on ws://localhost:${port}`)
