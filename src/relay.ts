@@ -1,7 +1,6 @@
-import { generateCode, generateToken, seatIdAt, seedFrom } from './rooms'
+import { MAX_SEATS, generateCode, generateToken, seatIdAt, seedFrom } from './rooms'
 import { CodeCollision, StaleRoom } from './store'
 import type { Room, RoomStore, SeatState } from './store'
-import { MAX_SEATS } from './protocol'
 import type { Action, Contract, Roster, SeatId, Send, WireMessage } from './protocol'
 
 // The relay core: a rules-ignorant sequencer shared by every game. It owns
