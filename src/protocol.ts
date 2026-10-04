@@ -12,9 +12,13 @@ export type SeatId = string
 
 export type Action = { readonly type: string; readonly [key: string]: unknown }
 
+// `bot` marks a computer player the room's creator added: it never
+// connects, and a connected human's client plays it (submitting actions
+// for its seat).
 export interface SeatInfo {
   readonly id: SeatId
   readonly name: string
+  readonly bot?: boolean
 }
 
 // The hand contract every client builds its initial state from. `seats` is
@@ -51,7 +55,7 @@ export type ErrorReason =
   | 'wrongGame' // the code belongs to a different game
   | 'badToken' // reconnect token doesn't match any seat
   | 'badRequest' // malformed create (game id, seat bounds)
-  | 'notCreator' // only seat 'a' may begin
+  | 'notCreator' // only seat 'a' may begin, or add or remove computer players
   | 'notEnoughPlayers' // begin before minSeats have joined
 
 export type WireMessage =
@@ -60,6 +64,10 @@ export type WireMessage =
   | { kind: 'join'; code: string; game: string; name: string; rnd: number }
   | { kind: 'reconnect'; code: string; token: string }
   | { kind: 'begin' }
+  // The creator fills an empty seat with a computer player, or takes one
+  // out again; lobby only. `rnd` is the bot's seed contribution.
+  | { kind: 'addBot'; name: string; rnd: number }
+  | { kind: 'removeBot'; seat: SeatId }
   // --- lobby (server -> client) ---
   | { kind: 'created'; code: string; token: string; seat: SeatId }
   | { kind: 'joined'; code: string; token: string; seat: SeatId }

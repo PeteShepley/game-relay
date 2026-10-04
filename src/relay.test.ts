@@ -173,6 +173,95 @@ describe('N seats', () => {
   })
 })
 
+describe('computer players', () => {
+  const addBot = (name: string, rnd: number): WireMessage => ({ kind: 'addBot', name, rnd })
+
+  test('the creator fills seats with bots, which count toward the start and ride in the contract', async () => {
+    const store = new InMemoryRoomStore()
+    const { code } = await createRoom(store, create('hearts', 4, 4, 1))
+    const added = await handleMessage(store, 'connA', addBot('Computer B', 2))
+    const roster = ofKind(added, 'connA', 'roster')
+    expect(roster?.seats).toEqual([
+      { id: 'a', name: 'Ada', connected: true },
+      { id: 'b', name: 'Computer B', connected: false, bot: true },
+    ])
+    await handleMessage(store, 'connA', addBot('Computer C', 3))
+    // A human still joins the open seat, after the bots.
+    const { joined } = await joinRoom(store, code, 'connD', 'Di', 4, 'hearts')
+    expect(joined?.seat).toBe('d')
+
+    // Full, but bots don't auto-start a room: a human join did, here.
+    const start = ofKind((await handleMessage(store, 'connA', { kind: 'resyncRequest' })), 'connA', 'start')
+    expect(start?.seed).toBe(seedFrom([1, 2, 3, 4]))
+    expect(start?.seats).toEqual([
+      { id: 'a', name: 'Ada' },
+      { id: 'b', name: 'Computer B', bot: true },
+      { id: 'c', name: 'Computer C', bot: true },
+      { id: 'd', name: 'Di' },
+    ])
+  })
+
+  test('filling the last seat with a bot waits for the creator to begin', async () => {
+    const store = new InMemoryRoomStore()
+    await createRoom(store, create('gin-rummy', 2, 2, 1))
+    const added = await handleMessage(store, 'connA', addBot('Computer', 9))
+    expect(ofKind(added, 'connA', 'start')).toBeUndefined()
+    const begun = await handleMessage(store, 'connA', { kind: 'begin' })
+    expect(ofKind(begun, 'connA', 'start')?.seats.map((seat) => seat.id)).toEqual(['a', 'b'])
+  })
+
+  test('only the creator adds or removes bots, only in the lobby, never past maxSeats', async () => {
+    const store = new InMemoryRoomStore()
+    const { code } = await createRoom(store, create('crazy-eights', 2, 3, 1))
+    await joinRoom(store, code, 'connB', 'Bo', 2, 'crazy-eights')
+    expect(await handleMessage(store, 'connB', addBot('Nope', 5))).toEqual([
+      { connectionId: 'connB', message: { kind: 'error', reason: 'notCreator' } },
+    ])
+    await handleMessage(store, 'connA', addBot('Computer C', 3))
+    expect(await handleMessage(store, 'connA', addBot('Computer D', 4))).toEqual([
+      { connectionId: 'connA', message: { kind: 'error', reason: 'roomFull' } },
+    ])
+    // Removing a human is a no-op; removing a bot reopens its seat.
+    expect(await handleMessage(store, 'connA', { kind: 'removeBot', seat: 'b' })).toEqual([])
+    const removed = await handleMessage(store, 'connA', { kind: 'removeBot', seat: 'c' })
+    expect(ofKind(removed, 'connB', 'roster')?.seats.map((seat) => seat.id)).toEqual(['a', 'b'])
+
+    await handleMessage(store, 'connA', addBot('Computer C', 3))
+    await handleMessage(store, 'connA', { kind: 'begin' })
+    expect(await handleMessage(store, 'connA', addBot('Late', 6))).toEqual([
+      { connectionId: 'connA', message: { kind: 'error', reason: 'alreadyStarted' } },
+    ])
+    expect(await handleMessage(store, 'connA', { kind: 'removeBot', seat: 'c' })).toEqual([])
+  })
+
+  test('a bot taken out of the middle leaves a letter the next seat reuses', async () => {
+    const store = new InMemoryRoomStore()
+    const { code } = await createRoom(store, create('hearts', 4, 4, 1))
+    await handleMessage(store, 'connA', addBot('Computer B', 2))
+    await handleMessage(store, 'connA', addBot('Computer C', 3))
+    await handleMessage(store, 'connA', { kind: 'removeBot', seat: 'b' })
+    const { joined } = await joinRoom(store, code, 'connX', 'Xu', 7, 'hearts')
+    expect(joined?.seat).toBe('b')
+  })
+
+  test('a bot has no token, so an empty one reattaches nothing', async () => {
+    const store = new InMemoryRoomStore()
+    const { code } = await createRoom(store, create('hearts', 4, 4, 1))
+    await handleMessage(store, 'connA', addBot('Computer B', 2))
+    expect(await handleMessage(store, 'connZ', { kind: 'reconnect', code, token: '' })).toEqual([
+      { connectionId: 'connZ', message: { kind: 'error', reason: 'badToken' } },
+    ])
+  })
+
+  test('a room whose only humans leave is abandoned, bots or not', async () => {
+    const store = new InMemoryRoomStore()
+    const { code } = await createRoom(store, create('hearts', 4, 4, 1))
+    await handleMessage(store, 'connA', addBot('Computer B', 2))
+    await handleDisconnect(store, 'connA')
+    expect(await store.getRoom(code)).toBeNull()
+  })
+})
+
 describe('submit', () => {
   test('stamps monotonically, persists, and fans out to every seat', async () => {
     const store = new InMemoryRoomStore()

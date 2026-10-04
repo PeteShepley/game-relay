@@ -52,3 +52,13 @@ export const MAX_SEATS = 8
 export function seatIdAt(index: number): string {
   return String.fromCharCode(97 + index)
 }
+
+// The first seat letter not in use. Seats letter in join order, but a
+// computer player taken out of the lobby leaves a gap, and the next seat
+// fills it rather than colliding with a later letter.
+export function nextSeatId(taken: readonly string[]): string {
+  for (let index = 0; ; index++) {
+    const id = seatIdAt(index)
+    if (!taken.includes(id)) return id
+  }
+}

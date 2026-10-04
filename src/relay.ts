@@ -1,4 +1,4 @@
-import { MAX_SEATS, generateCode, generateToken, seatIdAt, seedFrom } from './rooms'
+import { MAX_SEATS, generateCode, generateToken, nextSeatId, seedFrom } from './rooms'
 import { CodeCollision, StaleRoom } from './store'
 import type { Room, RoomStore, SeatState } from './store'
 import type { Action, Contract, Roster, SeatId, Send, WireMessage } from './protocol'
@@ -23,13 +23,15 @@ function contractOf(room: Room): Contract | null {
     game: room.game,
     seed: room.seed,
     dealer: room.seats[0].id,
-    seats: room.seats.map(({ id, name }) => ({ id, name })),
+    seats: room.seats.map(({ id, name, bot }) => (bot ? { id, name, bot } : { id, name })),
   }
 }
 
 function rosterOf(room: Room): Roster {
   return {
-    seats: room.seats.map(({ id, name, connected }) => ({ id, name, connected })),
+    seats: room.seats.map(({ id, name, connected, bot }) =>
+      bot ? { id, name, connected, bot } : { id, name, connected },
+    ),
     minSeats: room.minSeats,
     maxSeats: room.maxSeats,
     started: started(room),
@@ -101,6 +103,10 @@ export async function handleMessage(
       return reconnect(store, connectionId, message.code, message.token)
     case 'begin':
       return beginRequest(store, connectionId)
+    case 'addBot':
+      return addBot(store, connectionId, message.name, message.rnd)
+    case 'removeBot':
+      return removeBot(store, connectionId, message.seat)
     case 'submit':
       return submit(store, connectionId, message.action)
     case 'resyncRequest':
@@ -136,7 +142,7 @@ async function create(
   }
 
   const creator: SeatState = {
-    id: seatIdAt(0),
+    id: nextSeatId([]),
     conn: connectionId,
     name: cleanName(message.name),
     token: generateToken(),
@@ -198,7 +204,7 @@ async function join(
       if (room.seats.length >= room.maxSeats) return fail('roomFull')
 
       seat = {
-        id: seatIdAt(room.seats.length),
+        id: nextSeatId(room.seats.map((each) => each.id)),
         conn: connectionId,
         name: cleanName(message.name),
         token: generateToken(),
@@ -251,6 +257,61 @@ async function beginRequest(store: RoomStore, connectionId: string): Promise<Sen
   )
 }
 
+// The creator fills an empty seat with a computer player before the start.
+// It takes the next free letter, counts toward minSeats like anyone, and
+// never connects; a connected human's client plays it. Unlike a join, a
+// bot filling the last seat does not start the room - the creator does.
+async function addBot(store: RoomStore, connectionId: string, name: unknown, rnd: unknown): Promise<Send[]> {
+  const ref = await store.getConn(connectionId)
+  if (!ref) return []
+  const fail = (reason: 'notCreator' | 'roomFull' | 'alreadyStarted') => ({
+    next: null,
+    result: [to(connectionId, { kind: 'error', reason })],
+  })
+  return updateRoom<Send[]>(
+    store,
+    ref.code,
+    (room) => {
+      if (ref.seat !== room.seats[0].id) return fail('notCreator')
+      if (started(room)) return fail('alreadyStarted')
+      if (room.seats.length >= room.maxSeats) return fail('roomFull')
+      const bot: SeatState = {
+        id: nextSeatId(room.seats.map((each) => each.id)),
+        conn: null,
+        name: cleanName(name),
+        token: '',
+        connected: false,
+        rnd: Number(rnd) >>> 0,
+        bot: true,
+      }
+      const next: Room = { ...room, seats: [...room.seats, bot] }
+      return { next, result: broadcast(next, { kind: 'roster', ...rosterOf(next) }) }
+    },
+    [],
+  )
+}
+
+// The creator takes a computer player back out, before the start.
+async function removeBot(store: RoomStore, connectionId: string, seat: SeatId): Promise<Send[]> {
+  const ref = await store.getConn(connectionId)
+  if (!ref) return []
+  return updateRoom<Send[]>(
+    store,
+    ref.code,
+    (room) => {
+      if (ref.seat !== room.seats[0].id) {
+        return { next: null, result: [to(connectionId, { kind: 'error', reason: 'notCreator' })] }
+      }
+      const target = room.seats.find((each) => each.id === seat)
+      // Only a bot, only in the lobby; anything else is a harmless no-op.
+      if (started(room) || !target?.bot) return { next: null, result: [] }
+      const next: Room = { ...room, seats: room.seats.filter((each) => each !== target) }
+      return { next, result: broadcast(next, { kind: 'roster', ...rosterOf(next) }) }
+    },
+    [],
+  )
+}
+
 async function reconnect(
   store: RoomStore,
   connectionId: string,
@@ -263,7 +324,8 @@ async function reconnect(
     code,
     (room) => {
       seatId = null
-      const current = room.seats.find((seat) => seat.token === token)
+      // A computer player has no token and can never be reattached.
+      const current = room.seats.find((seat) => !seat.bot && seat.token === token)
       if (!current) return { next: null, result: [to(connectionId, { kind: 'error', reason: 'badToken' })] }
       seatId = current.id
 
