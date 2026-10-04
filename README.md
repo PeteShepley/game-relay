@@ -46,6 +46,8 @@ devDependency, so installing it pulls in nothing else.
 | `create {game, name, rnd, minSeats, maxSeats}` | `created {code, token, seat:'a'}` + `roster` |
 | `join {code, game, name, rnd}` | `joined {code, token, seat}` to the joiner, `roster` to all. When the last seat fills: `start` to all |
 | `begin` (creator only, ≥ `minSeats` seated) | `start` to all |
+| `addBot {name, rnd}` (creator only, lobby) | `roster` to all, with the new seat marked `bot: true` |
+| `removeBot {seat}` (creator only, lobby, a bot seat) | `roster` to all |
 | `reconnect {code, token}` | `created`/`joined` (lobby) or `start`/`resync` (in game), plus `roster` to all |
 | `submit {action}` | `action {seq, action}` to all |
 | `resyncRequest` | `start` (empty log) or `resync` |
@@ -53,7 +55,12 @@ devDependency, so installing it pulls in nothing else.
 
 - **Seats** are lettered in join order (`a`, `b`, `c`, …). The creator is `a`
   and is always the dealer. A two-seat game sees exactly the `'a' | 'b'` it
-  always has.
+  always has. A seat freed by `removeBot` is the next one handed out.
+- **Computer players** (`bot: true` in the roster and the contract) are
+  seats the creator added. They count toward `minSeats` but never connect, so
+  they don't start a full room by themselves (the creator sends `begin`) and
+  don't keep an abandoned room alive. The relay doesn't run them: a connected
+  human's client submits their actions, like any other action.
 - **Seed:** every seat contributes a random `rnd`. `seedFrom` folds them in
   seat order, so no single player can grind for a favourable deal. For two
   seats this produces the same seed as the original gin-rummy relay.

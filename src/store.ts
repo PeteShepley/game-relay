@@ -14,7 +14,8 @@ import type { SeatId, Stamped } from './protocol'
 // One seat's occupant. `conn` is the live connection id (null while the
 // player is disconnected); `token` is the reconnection secret; `connected`
 // tracks presence for the abandonment rule; `rnd` is the player's seed
-// contribution, folded in when the game starts.
+// contribution, folded in when the game starts. A `bot` seat is a computer
+// player: no connection, no token, never connected.
 export interface SeatState {
   readonly id: SeatId
   readonly conn: string | null
@@ -22,6 +23,7 @@ export interface SeatState {
   readonly token: string
   readonly connected: boolean
   readonly rnd: number
+  readonly bot?: boolean
 }
 
 // A room as the relay core sees it. `seats` is in seat order and seats[0] is
